@@ -11,40 +11,42 @@ using namespace cute;
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
+// #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using Element = elem_type;
     static constexpr bool Has_cp_async = true;
-#else
-    using Element = cutlass::half_t;
-    static constexpr bool Has_cp_async = false;
-#endif
+// #else
+//     using Element = cutlass::half_t;
+//     static constexpr bool Has_cp_async = false;
+// #endif
+    static_assert(Has_cp_async == true);
 
     using ElementAccum = float;
-    using index_t = uint32_t;
+    using index_t = uint32_t; 
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
+// #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
     >;
     using ValLayoutMNK = Layout<Shape<_1, _2, _1>>;
-#else
-    using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
-    using ValLayoutMNK = Layout<Shape<_1, _2, _2>>;
-#endif
+// #else
+//     using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
+//     using ValLayoutMNK = Layout<Shape<_1, _2, _2>>;
+// #endif
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
+// #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
-#else
-    using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
-    using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
-#endif
+// #else
+//     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
+//     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
+// #endif
 };
 
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
+// 64 64 64 4
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t,
          typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
 struct Flash_fwd_kernel_traits : public Base {
@@ -75,7 +77,7 @@ struct Flash_fwd_kernel_traits : public Base {
         // NOTE: cutlass v3.3
         // typename Base::ValLayoutMNK>; // 1x2x1 or 1x2x2 value group for 16x16x16 MMA and LDSM
         // cutlass v3.4
-        Tile<Int<16 * kNWarps>, _16, _16>>;
+        Tile<Int<16 * kNWarps>, _16, _16>>; // 64 16 16
 
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
@@ -122,7 +124,7 @@ struct Flash_fwd_kernel_traits : public Base {
     // TODO:
     static constexpr int kSmemSize = kSmemQSize + kSmemKVSize;
 
-    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
+    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element); // 128 / 16 = 8
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
 
     // TODO: review
@@ -136,6 +138,8 @@ struct Flash_fwd_kernel_traits : public Base {
     static_assert(kNThreads % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
+                                  // 16 8
+                                  // 8 1
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
