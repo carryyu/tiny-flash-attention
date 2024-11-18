@@ -39,7 +39,7 @@ const bool IS_CAUSAL = false;
 const int BS = 1;
 const int HEAD = 16;
 const int SEQLEN = 128 * 3;
-const int DIM = 64;
+const int DIM = 128;
 // const float softmax_scale = 1.f / sqrtf(static_cast<float>(SEQLEN));
 const float softmax_scale = 1.f;
 
@@ -607,7 +607,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // 8 * 16 -> 64 * 64, 2 2, 8, 4
   Tensor tSrK  = thr_mma.partition_fragment_B(sK); // (MMA,MMA_N,MMA_K)
   Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle); // (MMA, MMA_K,MMA_N)
-  // Tensor tOrVt  = thr_mma.partition_fragment_B(sV); // (MMA, MMA_K,MMA_N)
+  // Tensor tOrVt  = thr_mma.partition_fragment_B(sVt); // (MMA, MMA_K,MMA_N)
   if (cute::thread0()) {
     // printf("\tiled_mma:\n");
     // print(tiled_mma);
@@ -638,9 +638,20 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   // TODO: 拷贝时转置
   // NOTE: smem->reg拷贝Vt
+  // 16 * 16 each time -> 64 * 64, 8 * 4 * 4
   auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
   Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+  if (cute::thread0()) {
+    printf("\nsmem_tiled_copy_K:---------------------\n");
+    print(smem_tiled_copy_K);
+    printf("\nsmem_tiled_copy_V:---------------------\n");
+    print(smem_tiled_copy_V);
+    printf("\ntSsK:---------------------\n");
+    print(tSsK);
+    printf("\ntOsVt:---------------------\n");
+    print(tOsVt);
+  }
 
   // NOTE: 命名规则, t表示to, s/g表示位置(smem, gmem)
   // 从smem加载时做retiling
@@ -754,6 +765,26 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
       auto l = logical_divide(rAccScore.layout(), Shape<_2>{});
       printf("\nlogical_divide 2 :---------------------\n");
       print(l);
+      auto new_l = make_layout(make_layout(get<1>(get<0>(l)), get<1>(l)), make_layout(get<0>(get<0>(l)), get<2>(l)));
+      printf("\nnew_l :---------------------\n");
+      print(new_l);
+      auto div_shape = Shape<Underscore, Shape<Underscore, _2>>{};
+
+      printf("\ndiv_shape :---------------------\n");
+      print(div_shape);
+      auto l_areg = logical_divide(new_l, div_shape);
+      printf("\nlogical_divide l_areg :---------------------\n");
+      print(l_areg);
+
+      auto test_l = make_layout(make_layout(get<0>(get<0>(l_areg)), get<0>(get<1>(l_areg)), get<0>(get<1>(get<1>(l_areg)))),
+                       get<1>(get<0>(l_areg)),
+                       get<1>(get<1>(get<1>(l_areg))));
+      printf("\ntest_l :---------------------\n");
+      print(test_l);
+
+      auto l1 = logical_divide(rAccScore.layout(), Shape<_4>{});
+      printf("\nlogical_divide 4 :---------------------\n");
+      print(l1);
       printf("\nscores :---------------------\n");
       print_tensor(scores);
       printf("\nsize<1, 1>(scores) :---------------------\n");
