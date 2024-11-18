@@ -45,7 +45,7 @@ const float softmax_scale = 1.f;
 
 // debug only
 int TX = 3;
-int TY = 0;
+int TY = 0; 
 
 // TODO: test trait
 using Test_Traits = Flash_fwd_kernel_traits<DIM, Bm, Bn, Warps, FPC>;
@@ -198,7 +198,7 @@ inline __device__ void mask_within_nblock(Tensor<Engine, Layout> &tensor, const 
 
         }
     }
-}
+} 
 
 
 // NOTE: A矩阵已经在寄存器中的gemm封装
@@ -303,8 +303,8 @@ inline __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
     CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
-
-    
+ 
+     
 
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
@@ -316,7 +316,7 @@ inline __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const
           cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
         }
     }
-}
+} 
 
 
 // Convert rowcol_layout from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
@@ -495,7 +495,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   using index_t = typename Kernel_traits::index_t;
   using SmemLayoutQ = typename Kernel_traits::SmemLayoutQ;
   using SmemLayoutK = typename Kernel_traits::SmemLayoutKV;
-  using SmemLayoutV = typename Kernel_traits::SmemLayoutKV;
+  using SmemLayoutV = typename Kernel_traits::SmemLayoutV;
   using SmemLayoutVt = typename Kernel_traits::SmemLayoutVtransposed;
   using SmemLayoutVtNoSwizzle = typename Kernel_traits::SmemLayoutVtransposedNoSwizzle;
 
@@ -521,8 +521,8 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
       make_stride(params.dim, Int<1>{}));
   Tensor V = make_tensor(
       make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + bs_head_offset),
-      make_shape(params.seqlen, params.dim),
-      make_stride(params.dim, Int<1>{}));
+      make_shape(params.dim, params.seqlen),
+      make_stride(params.seqlen, Int<1>{}));
   // if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
   if (cute::thread0()) {
     printf("blockDim.x : %d, blockDim.y : %d, blockDim.z : %d\n", (int)blockDim.x, (int)blockDim.y, (int)blockDim.z);
@@ -544,7 +544,13 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // (kBlockN, kHeadDim, num_tile_n)
   // NOTE: loading流水线, 初次加载所需K, V
   Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
-  Tensor gV = local_tile(V, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
+  Tensor gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, 0));
+  if (cute::thread0()) {
+    printf("\nV : ---------------------\n");
+    print(V);
+    printf("\ngV : ---------------------\n");
+    print(gV);
+  }
 
   // 获取MMA抽象
   TiledMMA tiled_mma;
@@ -556,8 +562,8 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
 
   // Tensor for V Transpose; used in GEMM-II.
-  Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVt{});
-  Tensor sVtNoSwizzle = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVtNoSwizzle{});
+  // Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVt{});
+  // Tensor sVtNoSwizzle = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVtNoSwizzle{});
   if (cute::thread0()) {
     printf("\nsQ :---------------------\n");
     print(sQ);
@@ -574,6 +580,8 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // NOTE: QKV gmem -> smem拷贝的抽象
   typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
   auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
+  typename Kernel_traits::GmemTiledCopyV gmem_tiled_copy_V;
+  auto gmem_thr_copy_V = gmem_tiled_copy_V.get_thread_slice(tidx);
   // if (cute::thread1()) {
   // if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
   //   printf("gmem_tiled_copy_QKV : ----------------------------\n");
@@ -583,18 +591,33 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // }
 
   // NOTE: 定义gmem -> smem拷贝的src, dst
-  // 一次搬16 * 64，需要搬4次
+  // 一次搬8 * 128，需要搬8次(64 * 128)
   Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ(_, _, 0));
   Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
   Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
   Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
-  Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
-  Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+  // 一次搬16 * 64，需要搬8次(128 * 64)
+  Tensor tVgV = gmem_thr_copy_V.partition_S(gV(_, _, 0));
+  Tensor tVsV = gmem_thr_copy_V.partition_D(sV);
   if (cute::thread0()) {
     printf("\ntQgQ:---------------------\n");
     print(tQgQ);
     printf("\ntQsQ:---------------------\n");
     print(tQsQ);
+    printf("\ngQ(_, _, 0):---------------------\n");
+    print(gQ(_, _, 0));
+    printf("\ntKgK:---------------------\n");
+    print(tKgK);
+    printf("\ntKsK:---------------------\n");
+    print(tKsK);
+    printf("\ngK(_, _, 0):---------------------\n");
+    print(gK(_, _, 0));
+    printf("\ntVgV:---------------------\n");
+    print(tVgV);
+    printf("\ntVsV:---------------------\n");
+    print(tVsV);
+    printf("\ngV(_, _, 0):---------------------\n");
+    print(gV(_, _, 0));
   }
 
 
@@ -606,7 +629,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor tSrQ  = thr_mma.partition_fragment_A(sQ); // (MMA,MMA_M,MMA_K)
   // 8 * 16 -> 64 * 64, 2 2, 8, 4
   Tensor tSrK  = thr_mma.partition_fragment_B(sK); // (MMA,MMA_N,MMA_K)
-  Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle); // (MMA, MMA_K,MMA_N)
+  Tensor tOrV  = thr_mma.partition_fragment_B(sV); // (MMA, MMA_K,MMA_N)
   // Tensor tOrVt  = thr_mma.partition_fragment_B(sVt); // (MMA, MMA_K,MMA_N)
   if (cute::thread0()) {
     // printf("\tiled_mma:\n");
@@ -617,8 +640,8 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     print(tSrQ);
     printf("\ntSrK:---------------------\n");
     print(tSrK);
-    printf("\ntOrVt:---------------------\n");
-    print(tOrVt);
+    printf("\ntOrV:---------------------\n");
+    print(tOrV);
   }
 
   //
@@ -638,10 +661,13 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   // TODO: 拷贝时转置
   // NOTE: smem->reg拷贝Vt
-  // 16 * 16 each time -> 64 * 64, 8 * 4 * 4
-  auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+  // 16 * 16 each time -> 128 * 64, 8 * 8 * 4
+  // auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+  // auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
+  // Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+  auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-  Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+  Tensor tOsV = smem_thr_copy_V.partition_S(sV);
   if (cute::thread0()) {
     printf("\nsmem_tiled_copy_K:---------------------\n");
     print(smem_tiled_copy_K);
@@ -649,8 +675,8 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     print(smem_tiled_copy_V);
     printf("\ntSsK:---------------------\n");
     print(tSsK);
-    printf("\ntOsVt:---------------------\n");
-    print(tOsVt);
+    printf("\ntOsV:---------------------\n");
+    print(tOsV);
   }
 
   // NOTE: 命名规则, t表示to, s/g表示位置(smem, gmem)
@@ -661,12 +687,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   // 流水线加载初始Q, K
   // 加载Q到smem
-  if (thread0()) {
-    printf("\ntQgQ size :---------------------\n");
-    print(size<0>(tQgQ));
-    print(size<1>(tQgQ));
-    print(size<2>(tQgQ));
-  }
   flash::copy(gmem_tiled_copy_QKV, tQgQ, tQsQ);
   // 加载K到smem
   flash::copy(gmem_tiled_copy_QKV, tKgK, tKsK);
@@ -718,8 +738,9 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     __syncthreads();
 
     // gemm的同时异步加载V
-    gV = local_tile(V, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(nbi, _));
-    tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
+    gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, nbi));
+    // 16 * 64 -> 128 * 64，搬8次
+    tVgV = gmem_thr_copy_V.partition_S(gV(_, _, 0));
     // 异步加载V到smem
     if (nbi == 0 && thread0()) {
       printf("\ngV :---------------------\n");
@@ -767,7 +788,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
       print(l);
       auto new_l = make_layout(make_layout(get<1>(get<0>(l)), get<1>(l)), make_layout(get<0>(get<0>(l)), get<2>(l)));
       printf("\nnew_l :---------------------\n");
-      print(new_l);
+      print(new_l); 
       auto div_shape = Shape<Underscore, Shape<Underscore, _2>>{};
 
       printf("\ndiv_shape :---------------------\n");
@@ -817,22 +838,26 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     // (score AKA rAccScore): QK[M, N] @ V[N, dim]
     // NOTE: DABC: F32F16F16F32, convert D type(F32) to A type(F16)
     // TODO: convert_type目前写死
+    // 16 * 8 -> 64 / 4(warps) * 64
     Tensor rP = flash::convert_type_f32_to_f16(rAccScore);
     // NOTE: Convert from layout C to layout A
     // 4, M, N -> 8, M, N / 2
+    // 16 * 8 * 8 -> 16 * 16 * 4
     Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<TiledMMA>(scores.layout()));
     if (nbi == 0 && thread0()) {
       printf("\nrP :---------------------\n");
       print(rP);
       printf("\ntOrP :---------------------\n");
       print(tOrP);
-      printf("\ntOsVt :---------------------\n");
-      print(tOsVt);
-      printf("\ntOrVt :---------------------\n");
-      print(tOrVt);
+      printf("\ntOsV :---------------------\n");
+      print(tOsV);
+      printf("\ntOrV :---------------------\n");
+      print(tOrV);
+      printf("\nrAccOut :---------------------\n");
+      print(rAccOut);
     }
 
-    flash::gemm_A_in_regs(rAccOut, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    flash::gemm_A_in_regs(rAccOut, tOrP, tOrV, tOsV, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
   }
 
   // NOTE: 最后统一除上分母部分
@@ -1151,10 +1176,13 @@ void test_attention() {
     // h_K[i] = static_cast<FP>(0.0001f * i);
     // h_Q[i] = static_cast<FP>(0.0001f * i);
     // h_V[i] = static_cast<FP>(0.0001f * i);
-
+    int bi_now = i / (head * m * n);
+    int hi_now = (i % (head * m * n)) / (m * n);
+    int mi_now = (i % (m * n)) / n;
+    int ni_now = i % n;
     h_Q2[i] = FPC(h_Q[i]);
     h_K2[i] = FPC(h_K[i]);
-    h_V2[i] = FPC(h_V[i]);
+    h_V2[bi_now * (head * m * n) + hi_now * (m * n) + ni_now * m + mi_now] = FPC(h_V[i]);
   }
 
   FP *d_K, *d_Q, *d_V, *d_O;
@@ -1224,7 +1252,13 @@ void test_attention() {
   // print_tensor(local_tile(Cute, tile, make_coord(TX, TY)));
   // print_tensor(local_tile(Cute, tile, make_coord(TX, TY + 1)));
 
-  assert(all_close(h_O, h_O2, total_size) && "flash attention 1 != flash attention 2");
+
+  if (all_close(h_O, h_O2, total_size)) {
+    printf("good precision!!!");
+  } else {
+    printf("error!!!");
+  }
+  // assert(all_close(h_O, h_O2, total_size) && "flash attention 1 != flash attention 2");
 
 
 

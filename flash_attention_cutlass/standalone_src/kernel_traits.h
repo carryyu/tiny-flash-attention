@@ -67,9 +67,11 @@ struct Flash_fwd_kernel_traits : public Base {
 
     // TODO: review
     static_assert(kHeadDim % 32 == 0);
-    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+    // static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+    static constexpr int kBlockKSmem = 128; // 128
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
-    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+    // static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+    static constexpr int kSwizzle = kBlockKSmem == 3;
 
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
@@ -77,13 +79,18 @@ struct Flash_fwd_kernel_traits : public Base {
         // NOTE: cutlass v3.3
         // typename Base::ValLayoutMNK>; // 1x2x1 or 1x2x2 value group for 16x16x16 MMA and LDSM
         // cutlass v3.4
-        Tile<Int<16 * kNWarps>, _16, _16>>; // 64 16 16
+        Tile<Int<16 * kNWarps>, _16, _16>>; // 64 16 16 ldmatrix 16 * 16 each time
 
     using SmemLayoutAtomQ = decltype(
-        composition(Swizzle<kSwizzle, 3, 3>{},
+        composition(Swizzle<kSwizzle, 3, 4>{}, // kSwizzle, 3, 4 BMS
                     // This has to be kBlockKSmem, using kHeadDim gives wrong results for d=128
                     Layout<Shape<_8, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+    using SmemLayoutAtomV = decltype(
+        composition(Swizzle<kSwizzle, 3, 3>{},
+                    // This has to be kBlockKSmem, using kHeadDim gives wrong results for d=128
+                    Layout<Shape<_8, Int<64>>,
+                           Stride<Int<64>, _1>>{}));
     using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
@@ -91,6 +98,9 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemLayoutKV = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+    using SmemLayoutV = decltype(tile_to_shape(
+        SmemLayoutAtomV{},
+        Shape<Int<kHeadDim>, Int<kBlockN>>{}));
 
     // This has to be kBlockN and not 8, otherwise we get wrong results for d=128
     using SmemLayoutAtomVtransposedNoSwizzle = Layout<Shape<Int<kBlockKSmem>, Int<kBlockN>>,
@@ -140,6 +150,10 @@ struct Flash_fwd_kernel_traits : public Base {
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
                                   // 16 8
                                   // 8 1
+    static constexpr int kGmemThreadsPerRowV = kBlockN / kGmemElemsPerLoad;
+    static_assert(kNThreads % kGmemThreadsPerRowV == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
+    using GmemLayoutAtomV = Layout<Shape <Int<kNThreads / kGmemThreadsPerRowV>, Int<kGmemThreadsPerRowV>>,
+                                  Stride<Int<kGmemThreadsPerRowV>, _1>>;
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
@@ -151,6 +165,10 @@ struct Flash_fwd_kernel_traits : public Base {
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
+                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+    using GmemTiledCopyV = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
+                        GmemLayoutAtomV{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
